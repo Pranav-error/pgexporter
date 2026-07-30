@@ -52,6 +52,7 @@
 #include <server.h>
 #include <shmem.h>
 #include <status.h>
+#include <tls.h>
 #include <utils.h>
 #include <yaml_configuration.h>
 #include <alert_configuration.h>

@@ -43,6 +43,7 @@ set(TESTCASE_FILES
   testcases/test_history.c
   testcases/test_history_http.c
   testcases/test_message_complete.c
+  testcases/test_tls.c
 )
 set(SOURCE_FILES ${LIB_SOURCE_FILES} ${TESTCASE_FILES} ${HEADER_FILES})
 

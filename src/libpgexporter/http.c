@@ -32,6 +32,7 @@
 #include <logging.h>
 #include <network.h>
 #include <security.h>
+#include <tls.h>
 #include <utils.h>
 
 /* system */
