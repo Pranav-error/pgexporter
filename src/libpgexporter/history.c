@@ -28,6 +28,7 @@
 
 /* pgexporter */
 #include <pgexporter.h>
+#include <deque.h>
 #include <history.h>
 #include <history_sqlite.h>
 #include <http.h>
@@ -661,7 +662,7 @@ pgexporter_history_http(SSL* ssl, int fd)
       query++;
    }
 
-   if (strncmp(path, "/history/", strlen("/history/")) != 0 || strlen(path) <= strlen("/history/"))
+   if (strncmp(path, "/history/", strlen("/history/")) != 0)
    {
       pgexporter_http_respond_404(ssl, fd);
       goto done;
@@ -721,6 +722,15 @@ pgexporter_history_http(SSL* ssl, int fd)
    }
 
    if (pgexporter_json_create(&root))
+   {
+      pgexporter_http_respond_500(ssl, fd);
+      goto done;
+   }
+
+   /* Force root to be a JSON array even when 0 records are returned, so the
+    * response is always "[]", never "{}" for an empty result. */
+   root->type = JSONArray;
+   if (pgexporter_deque_create(false, (struct deque**)&root->elements))
    {
       pgexporter_http_respond_500(ssl, fd);
       goto done;

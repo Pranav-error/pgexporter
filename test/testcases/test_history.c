@@ -441,6 +441,150 @@ cleanup:
    MCTF_FINISH();
 }
 
+MCTF_TEST_NEGATIVE(test_history_store_metrics_null_container)
+{
+   MCTF_ASSERT_INT_EQ(pgexporter_history_store_metrics(NULL), 1, cleanup,
+                      "store_metrics with NULL container should fail");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_store_metrics_crlf_line_ending)
+{
+   struct configuration* config = (struct configuration*)shmem;
+   prometheus_metrics_container_t* container = NULL;
+   struct art* t = NULL;
+   struct history_record* out = NULL;
+   int out_len = 0;
+   time_t now = time(NULL);
+
+   unlink_db("test_crlf.db");
+   pgexporter_snprintf(config->history_path, MAX_PATH, "test_crlf.db");
+   MCTF_ASSERT_INT_EQ(pgexporter_history_init(), 0, cleanup, "history_init failed");
+
+   container = malloc(sizeof(prometheus_metrics_container_t));
+   memset(container, 0, sizeof(prometheus_metrics_container_t));
+
+   pgexporter_art_create(&t);
+   container->general_metrics = t;
+
+   struct mock_prometheus_metric_value m;
+   memset(&m, 0, sizeof(m));
+   m.value = "crlf_metric 7\r\n";
+   pgexporter_art_insert(t, "m", (uintptr_t)&m, ValueRef);
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_store_metrics(container), 0, cleanup, "store_metrics returned error");
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_query_range("crlf_metric", now - 10, now + 10, &out, &out_len), 0,
+                      cleanup, "query failed");
+   MCTF_ASSERT_INT_EQ(out_len, 1, cleanup, "expected 1 record for crlf_metric, got %d", out_len);
+   MCTF_ASSERT(out[0].value == 7.0, cleanup, "expected value 7, trailing \\r not stripped correctly");
+
+cleanup:
+   pgexporter_history_records_free(out, out_len);
+   if (container)
+   {
+      if (container->general_metrics)
+         pgexporter_art_destroy(container->general_metrics);
+      free(container);
+   }
+   pgexporter_history_shutdown();
+   unlink_db("test_crlf.db");
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_store_metrics_escaped_quote_in_label)
+{
+   struct configuration* config = (struct configuration*)shmem;
+   prometheus_metrics_container_t* container = NULL;
+   struct art* t = NULL;
+   struct history_record* out = NULL;
+   int out_len = 0;
+   time_t now = time(NULL);
+
+   unlink_db("test_escaped_quote.db");
+   pgexporter_snprintf(config->history_path, MAX_PATH, "test_escaped_quote.db");
+   MCTF_ASSERT_INT_EQ(pgexporter_history_init(), 0, cleanup, "history_init failed");
+
+   container = malloc(sizeof(prometheus_metrics_container_t));
+   memset(container, 0, sizeof(prometheus_metrics_container_t));
+
+   pgexporter_art_create(&t);
+   container->general_metrics = t;
+
+   /* The label value contains an escaped quote (\") and a literal '}' inside quotes. */
+   struct mock_prometheus_metric_value m;
+   memset(&m, 0, sizeof(m));
+   m.value = "escaped_metric{server=\"db1\",note=\"a\\\"b}c\"} 5\n";
+   pgexporter_art_insert(t, "m", (uintptr_t)&m, ValueRef);
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_store_metrics(container), 0, cleanup, "store_metrics returned error");
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_query_range("escaped_metric", now - 10, now + 10, &out, &out_len), 0,
+                      cleanup, "query failed");
+   MCTF_ASSERT_INT_EQ(out_len, 1, cleanup, "expected 1 record for escaped_metric, got %d", out_len);
+   MCTF_ASSERT_STR_EQ(out[0].server, "db1", cleanup, "expected server db1");
+   MCTF_ASSERT(out[0].value == 5.0, cleanup, "expected value 5, brace/quote scanning mis-terminated the label set");
+
+cleanup:
+   pgexporter_history_records_free(out, out_len);
+   if (container)
+   {
+      if (container->general_metrics)
+         pgexporter_art_destroy(container->general_metrics);
+      free(container);
+   }
+   pgexporter_history_shutdown();
+   unlink_db("test_escaped_quote.db");
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_store_metrics_bare_metric_no_value)
+{
+   struct configuration* config = (struct configuration*)shmem;
+   prometheus_metrics_container_t* container = NULL;
+   struct art* t = NULL;
+   struct history_record* out = NULL;
+   int out_len = 0;
+   time_t now = time(NULL);
+
+   unlink_db("test_bare_metric.db");
+   pgexporter_snprintf(config->history_path, MAX_PATH, "test_bare_metric.db");
+   MCTF_ASSERT_INT_EQ(pgexporter_history_init(), 0, cleanup, "history_init failed");
+
+   container = malloc(sizeof(prometheus_metrics_container_t));
+   memset(container, 0, sizeof(prometheus_metrics_container_t));
+
+   pgexporter_art_create(&t);
+   container->general_metrics = t;
+
+   /* A line with a metric name but no trailing value at all. */
+   struct mock_prometheus_metric_value m;
+   memset(&m, 0, sizeof(m));
+   m.value = "bare_metric\n";
+   pgexporter_art_insert(t, "m", (uintptr_t)&m, ValueRef);
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_store_metrics(container), 0, cleanup, "store_metrics returned error");
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_query_range("bare_metric", now - 10, now + 10, &out, &out_len), 0,
+                      cleanup, "query failed");
+   MCTF_ASSERT_INT_EQ(out_len, 1, cleanup, "expected 1 record for bare_metric, got %d", out_len);
+   MCTF_ASSERT(out[0].value == 0.0, cleanup, "missing value should default to 0.0");
+
+cleanup:
+   pgexporter_history_records_free(out, out_len);
+   if (container)
+   {
+      if (container->general_metrics)
+         pgexporter_art_destroy(container->general_metrics);
+      free(container);
+   }
+   pgexporter_history_shutdown();
+   unlink_db("test_bare_metric.db");
+   MCTF_FINISH();
+}
+
 MCTF_TEST(test_history_prune_deletes_old_keeps_new)
 {
    struct configuration* config = (struct configuration*)shmem;
