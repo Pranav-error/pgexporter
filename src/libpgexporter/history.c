@@ -366,7 +366,6 @@ pgexporter_history_records_free(struct history_record* records, int count)
 static void
 history_tick_worker(void)
 {
-   struct configuration* config = (struct configuration*)shmem;
    prometheus_metrics_container_t* container = NULL;
 
    if (pgexporter_history_init() != 0)
@@ -390,9 +389,55 @@ child_done:
    }
 
    pgexporter_history_shutdown();
+   pgexporter_history_release_slot();
+   exit(0);
+}
+
+bool
+pgexporter_history_claim_slot(int interval)
+{
+   struct configuration* config = (struct configuration*)shmem;
+   bool expected = false;
+   time_t now = time(NULL);
+
+   if (config == NULL || config->history == 0)
+   {
+      return false;
+   }
+
+   if (interval == 0)
+   {
+      return false;
+   }
+
+   if (!atomic_compare_exchange_strong(&config->history_worker_running, &expected, true))
+   {
+      return false;
+   }
+
+   if (interval > 0 &&
+       (time_t)atomic_load(&config->history_last_store_time) / interval == now / interval)
+   {
+      atomic_store(&config->history_worker_running, false);
+      return false;
+   }
+   atomic_store(&config->history_worker_pid, (int)getpid());
+
+   return true;
+}
+
+void
+pgexporter_history_release_slot(void)
+{
+   struct configuration* config = (struct configuration*)shmem;
+
+   if (config == NULL)
+   {
+      return;
+   }
+
    atomic_store(&config->history_worker_pid, 0);
    atomic_store(&config->history_worker_running, false);
-   exit(0);
 }
 
 void
@@ -400,29 +445,14 @@ pgexporter_history_tick_cb(void)
 {
    struct configuration* config = (struct configuration*)shmem;
    pid_t pid;
-   time_t now = time(NULL);
-   int tick_time = 0;
-   bool expected = false;
 
-   if (config == NULL || config->history == 0)
+   if (config == NULL)
    {
       return;
    }
 
-   tick_time = pgexporter_time_convert(config->history_interval, FORMAT_TIME_S);
-   if (tick_time <= 0)
+   if (!pgexporter_history_claim_slot(pgexporter_time_convert(config->history_interval, FORMAT_TIME_S)))
    {
-      return;
-   }
-
-   if (now < (time_t)atomic_load(&config->history_last_store_time) + tick_time)
-   {
-      return;
-   }
-
-   if (!atomic_compare_exchange_strong(&config->history_worker_running, &expected, true))
-   {
-      /* Worker already running */
       return;
    }
 
@@ -430,13 +460,13 @@ pgexporter_history_tick_cb(void)
    if (pid < 0)
    {
       pgexporter_log_error("history: failed to fork ticker worker");
-      atomic_store(&config->history_worker_running, false);
+      pgexporter_history_release_slot();
       return;
    }
    else if (pid > 0)
    {
-      /* Record worker pid so sigchld_cb can clear the running flag
-       * if the worker dies before resetting it itself. */
+      /* claim_slot() recorded our own pid; replace it with the worker's so
+       * sigchld_cb can clear the flag if the worker dies before resetting it. */
       atomic_store(&config->history_worker_pid, (int)pid);
       return;
    }

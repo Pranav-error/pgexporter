@@ -541,11 +541,10 @@ retry_cache_locking:
          /* Output ART metrics */
          output_all_metrics(client_ssl, client_fd, container);
 
-         /* Store metrics in history */
+         /* Store metrics in history immediately. */
          if (config->history > 0)
          {
-            bool expected = false;
-            if (atomic_compare_exchange_strong(&config->history_worker_running, &expected, true))
+            if (pgexporter_history_claim_slot(-1))
             {
                if (pgexporter_history_init() == 0)
                {
@@ -554,7 +553,7 @@ retry_cache_locking:
                      pgexporter_log_warn("history: failed to store metrics snapshot");
                   }
                }
-               atomic_store(&config->history_worker_running, false);
+               pgexporter_history_release_slot();
             }
          }
 

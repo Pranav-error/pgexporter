@@ -137,6 +137,25 @@ int
 pgexporter_history_store_metrics(struct prometheus_metrics_container* container);
 
 /**
+ * Claim the exclusive right to write a history snapshot.
+ *
+ * Fails if another writer already holds the slot, or if the current
+ * history_interval bucket already contains a snapshot. On success the caller
+ * must invoke pgexporter_history_release_slot() once it is done.
+ *
+ * @param interval Minimum seconds between snapshots, or -1 to snapshot immediately
+ * @return true if the slot was claimed, otherwise false
+ */
+bool
+pgexporter_history_claim_slot(int interval);
+
+/**
+ * Release a slot claimed by pgexporter_history_claim_slot().
+ */
+void
+pgexporter_history_release_slot(void);
+
+/**
  * Periodic callback: fork a history worker to snapshot current metrics.
  * Skipped if a previous worker is still running.
  */
