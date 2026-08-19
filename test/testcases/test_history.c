@@ -44,6 +44,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <sqlite3.h>
+
 /*
  * Path of the SQLite database used by the test currently running. Set in
  * setup, unlinked in teardown so every test starts from an empty database.
@@ -89,6 +91,94 @@ unlink_db(const char* path)
    unlink(sibling);
    pgexporter_snprintf(sibling, MAX_PATH, "%s-journal", path);
    unlink(sibling);
+}
+
+/*
+ * Run a scalar query against the history database on a second connection and
+ * return the first column of the first row, or -1 if anything went wrong.
+ * The backend keeps its own connection open in WAL mode, so a reader here sees
+ * everything it has committed.
+ */
+static int64_t
+db_scalar(const char* sql)
+{
+   sqlite3* conn = NULL;
+   sqlite3_stmt* stmt = NULL;
+   int64_t result = -1;
+
+   if (sqlite3_open_v2(db_path, &conn, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK)
+   {
+      goto done;
+   }
+
+   if (sqlite3_prepare_v2(conn, sql, -1, &stmt, NULL) != SQLITE_OK)
+   {
+      goto done;
+   }
+
+   if (sqlite3_step(stmt) == SQLITE_ROW)
+   {
+      result = (int64_t)sqlite3_column_int64(stmt, 0);
+   }
+
+done:
+   if (stmt)
+   {
+      sqlite3_finalize(stmt);
+   }
+   if (conn)
+   {
+      sqlite3_close_v2(conn);
+   }
+
+   return result;
+}
+
+/*
+ * Copy the first column of the first row into `out` as text. Returns false if
+ * the query produced no row.
+ */
+static bool
+db_text(const char* sql, char* out, size_t out_size)
+{
+   sqlite3* conn = NULL;
+   sqlite3_stmt* stmt = NULL;
+   bool found = false;
+
+   out[0] = '\0';
+
+   if (sqlite3_open_v2(db_path, &conn, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK)
+   {
+      goto done;
+   }
+
+   if (sqlite3_prepare_v2(conn, sql, -1, &stmt, NULL) != SQLITE_OK)
+   {
+      goto done;
+   }
+
+   if (sqlite3_step(stmt) == SQLITE_ROW)
+   {
+      const unsigned char* text = sqlite3_column_text(stmt, 0);
+
+      if (text != NULL)
+      {
+         pgexporter_snprintf(out, out_size, "%s", (const char*)text);
+      }
+      found = true;
+   }
+
+done:
+   if (stmt)
+   {
+      sqlite3_finalize(stmt);
+   }
+   if (conn)
+   {
+      sqlite3_close_v2(conn);
+   }
+
+   return found;
 }
 
 MCTF_TEST_SETUP(history)
@@ -205,12 +295,14 @@ MCTF_TEST(test_history_query_metric_filter)
 
    MCTF_ASSERT_INT_EQ(pgexporter_history_init(), 0, cleanup, "init failed");
 
+   /* in[0] and in[2] are the same series, so they need distinct timestamps:
+    * one series holds one value per instant. */
    make_record(&in[0], now, "s", "metric_a", "", 1.0);
    make_record(&in[1], now, "s", "metric_b", "", 2.0);
-   make_record(&in[2], now, "s", "metric_a", "", 3.0);
+   make_record(&in[2], now + 1, "s", "metric_a", "", 3.0);
    MCTF_ASSERT_INT_EQ(pgexporter_history_write_batch(in, 3), 0, cleanup, "write failed");
 
-   MCTF_ASSERT_INT_EQ(pgexporter_history_query_range("metric_a", now - 1, now + 1, &out, &count), 0,
+   MCTF_ASSERT_INT_EQ(pgexporter_history_query_range("metric_a", now - 1, now + 2, &out, &count), 0,
                       cleanup, "query failed");
    MCTF_ASSERT_INT_EQ(count, 2, cleanup, "expected 2 metric_a rows, got %d", count);
    MCTF_ASSERT_STR_EQ(out[0].metric, "metric_a", cleanup, "filtered metric mismatch");
@@ -740,6 +832,413 @@ MCTF_TEST(test_history_prune_spans_all_metrics)
    MCTF_ASSERT_INT_EQ(pgexporter_history_query_range("metric_b", 0, now + 10, NULL, &count), 0,
                       cleanup, "query metric_b failed");
    MCTF_ASSERT_INT_EQ(count, 1, cleanup, "metric_b should have 1 row after prune, got %d", count);
+
+cleanup:
+   MCTF_FINISH();
+}
+
+/* Schema shape */
+MCTF_TEST(test_history_schema_tables)
+{
+   MCTF_ASSERT_INT_EQ(pgexporter_history_init(), 0, cleanup, "init failed");
+
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'series';"),
+                      1, cleanup, "series table missing");
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sample';"),
+                      1, cleanup, "sample table missing");
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_sample_ts';"),
+                      1, cleanup, "idx_sample_ts missing: prune and multi-series reads would scan");
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'history';"),
+                      0, cleanup, "the flat history table should be gone");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_reopen_preserves_data)
+{
+   struct history_record in[1];
+   struct history_record* out = NULL;
+   int count = 0;
+   time_t base = 4600000;
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_init(), 0, cleanup, "init failed");
+
+   make_record(&in[0], base, "primary", "pg_up", "server=\"primary\"", 5.0);
+   MCTF_ASSERT_INT_EQ(pgexporter_history_write_batch(in, 1), 0, cleanup, "write failed");
+   MCTF_ASSERT_INT_EQ(pgexporter_history_shutdown(), 0, cleanup, "shutdown failed");
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_init(), 0, cleanup, "reopen failed");
+   MCTF_ASSERT_INT_EQ(pgexporter_history_query_range("pg_up", base, base, &out, &count), 0, cleanup, "query failed");
+   MCTF_ASSERT_INT_EQ(count, 1, cleanup, "the sample written before shutdown should survive, got %d", count);
+   MCTF_ASSERT(out[0].value == 5.0, cleanup, "value changed across reopen");
+
+cleanup:
+   pgexporter_history_records_free(out, count);
+   MCTF_FINISH();
+}
+
+/* Canonical label hash */
+MCTF_TEST(test_history_label_hash_shape)
+{
+   char hash[HISTORY_LABEL_HASH_LENGTH];
+   size_t i;
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash("server=\"a\"", hash), 0, cleanup, "hash failed");
+   MCTF_ASSERT_INT_EQ((int)strlen(hash), HISTORY_LABEL_HASH_LENGTH - 1, cleanup,
+                      "expected %d hex characters, got %d", HISTORY_LABEL_HASH_LENGTH - 1, (int)strlen(hash));
+
+   for (i = 0; i < strlen(hash); i++)
+   {
+      MCTF_ASSERT((hash[i] >= '0' && hash[i] <= '9') || (hash[i] >= 'a' && hash[i] <= 'f'), cleanup,
+                  "hash character %zu is '%c', expected lowercase hex", i, hash[i]);
+   }
+
+cleanup:
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_label_hash_is_stable)
+{
+   char first[HISTORY_LABEL_HASH_LENGTH];
+   char second[HISTORY_LABEL_HASH_LENGTH];
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash("a=\"1\",b=\"2\"", first), 0, cleanup, "hash failed");
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash("a=\"1\",b=\"2\"", second), 0, cleanup, "hash failed");
+   MCTF_ASSERT_STR_EQ(first, second, cleanup, "the same label set must hash the same way twice");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+/* UNIQUE constraint on the raw label string
+ * would split one series in two as soon as emission order changed. */
+MCTF_TEST(test_history_label_hash_ignores_order)
+{
+   char forward[HISTORY_LABEL_HASH_LENGTH];
+   char reverse[HISTORY_LABEL_HASH_LENGTH];
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash("a=\"1\",b=\"2\",c=\"3\"", forward), 0, cleanup, "hash failed");
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash("c=\"3\",a=\"1\",b=\"2\"", reverse), 0, cleanup, "hash failed");
+   MCTF_ASSERT_STR_EQ(forward, reverse, cleanup, "label order must not change the hash");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_label_hash_separates_distinct_sets)
+{
+   char a[HISTORY_LABEL_HASH_LENGTH];
+   char b[HISTORY_LABEL_HASH_LENGTH];
+   char empty[HISTORY_LABEL_HASH_LENGTH];
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash("database=\"one\"", a), 0, cleanup, "hash failed");
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash("database=\"two\"", b), 0, cleanup, "hash failed");
+   MCTF_ASSERT(strcmp(a, b) != 0, cleanup, "different label values must hash differently");
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash("", empty), 0, cleanup, "hash failed");
+   MCTF_ASSERT(strcmp(a, empty) != 0, cleanup, "a labelled series must not collide with an unlabelled one");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_label_hash_null_matches_empty)
+{
+   char from_null[HISTORY_LABEL_HASH_LENGTH];
+   char from_empty[HISTORY_LABEL_HASH_LENGTH];
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash(NULL, from_null), 0, cleanup, "hash of NULL failed");
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash("", from_empty), 0, cleanup, "hash of \"\" failed");
+   MCTF_ASSERT_STR_EQ(from_null, from_empty, cleanup, "no labels must hash the same either way");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_label_hash_unparsable_is_stable)
+{
+   char first[HISTORY_LABEL_HASH_LENGTH];
+   char second[HISTORY_LABEL_HASH_LENGTH];
+   char other[HISTORY_LABEL_HASH_LENGTH];
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash("broken", first), 0, cleanup, "hash failed");
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash("broken", second), 0, cleanup, "hash failed");
+   MCTF_ASSERT_STR_EQ(first, second, cleanup, "unparsable input must still hash consistently");
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash("also broken", other), 0, cleanup, "hash failed");
+   MCTF_ASSERT(strcmp(first, other) != 0, cleanup, "distinct unparsable input must not collide");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_label_hash_orders_duplicate_keys)
+{
+   char forward[HISTORY_LABEL_HASH_LENGTH];
+   char reverse[HISTORY_LABEL_HASH_LENGTH];
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash("a=\"1\",a=\"2\"", forward), 0, cleanup, "hash failed");
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash("a=\"2\",a=\"1\"", reverse), 0, cleanup, "hash failed");
+   MCTF_ASSERT_STR_EQ(forward, reverse, cleanup, "repeated keys must still sort deterministically");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_label_hash_handles_sql_label_value)
+{
+   char with_query[HISTORY_LABEL_HASH_LENGTH];
+   char reordered[HISTORY_LABEL_HASH_LENGTH];
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash(
+                         "query=\"SELECT a, b FROM t WHERE c = \\\"x\\\"\",server=\"primary\"", with_query),
+                      0, cleanup, "hash failed");
+   MCTF_ASSERT_INT_EQ(pgexporter_history_label_hash(
+                         "server=\"primary\",query=\"SELECT a, b FROM t WHERE c = \\\"x\\\"\"", reordered),
+                      0, cleanup, "hash failed");
+   MCTF_ASSERT_STR_EQ(with_query, reordered, cleanup,
+                      "a value holding commas and escaped quotes must not break pair splitting");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+/* Label lookup */
+MCTF_TEST(test_history_label_find_basic)
+{
+   char value[MISC_LENGTH];
+
+   MCTF_ASSERT(pgexporter_history_label_find("server=\"primary\",database=\"pgbench\"", "server", value, sizeof(value)),
+               cleanup, "server should be found");
+   MCTF_ASSERT_STR_EQ(value, "primary", cleanup, "wrong server value");
+
+   MCTF_ASSERT(pgexporter_history_label_find("server=\"primary\",database=\"pgbench\"", "database", value, sizeof(value)),
+               cleanup, "database should be found");
+   MCTF_ASSERT_STR_EQ(value, "pgbench", cleanup, "wrong database value");
+
+   MCTF_ASSERT(!pgexporter_history_label_find("server=\"primary\"", "missing", value, sizeof(value)),
+               cleanup, "absent key should not be found");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_label_find_rejects_substring_key)
+{
+   char value[MISC_LENGTH];
+
+   MCTF_ASSERT(!pgexporter_history_label_find("upstream_server=\"other\"", "server", value, sizeof(value)),
+               cleanup, "'server' must not match the tail of 'upstream_server'");
+
+   MCTF_ASSERT(pgexporter_history_label_find("upstream_server=\"other\",server=\"real\"", "server", value, sizeof(value)),
+               cleanup, "the real server label should still be found");
+   MCTF_ASSERT_STR_EQ(value, "real", cleanup, "matched the wrong label");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_label_find_escaped_quote)
+{
+   char value[MISC_LENGTH];
+
+   MCTF_ASSERT(pgexporter_history_label_find("note=\"a\\\"b\",server=\"primary\"", "server", value, sizeof(value)),
+               cleanup, "an escaped quote must not end the preceding value");
+   MCTF_ASSERT_STR_EQ(value, "primary", cleanup, "wrong server value");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+/* Series identity */
+MCTF_TEST(test_history_series_written_once)
+{
+   struct history_record in[1];
+   time_t base = 4000000;
+   int i;
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_init(), 0, cleanup, "init failed");
+
+   /* Ten snapshots of one series, written as ten separate batches the way the
+    * collection path would produce them. */
+   for (i = 0; i < 10; i++)
+   {
+      make_record(&in[0], base + (i * 60), "primary", "pg_up", "server=\"primary\"", (double)i);
+      MCTF_ASSERT_INT_EQ(pgexporter_history_write_batch(in, 1), 0, cleanup, "write %d failed", i);
+   }
+
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM series;"), 1, cleanup,
+                      "ten snapshots of one series should store one series row");
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM sample;"), 10, cleanup,
+                      "ten snapshots should store ten samples");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_series_survives_label_reorder)
+{
+   struct history_record in[2];
+   struct history_record* out = NULL;
+   int count = 0;
+   time_t base = 4100000;
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_init(), 0, cleanup, "init failed");
+
+   make_record(&in[0], base, "primary", "pg_x", "server=\"primary\",database=\"pgbench\"", 1.0);
+   make_record(&in[1], base + 60, "primary", "pg_x", "database=\"pgbench\",server=\"primary\"", 2.0);
+   MCTF_ASSERT_INT_EQ(pgexporter_history_write_batch(in, 2), 0, cleanup, "write failed");
+
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM series;"), 1, cleanup,
+                      "reordered labels must resolve to the same series, not a second one");
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_query_range("pg_x", base, base + 60, &out, &count), 0,
+                      cleanup, "query failed");
+   MCTF_ASSERT_INT_EQ(count, 2, cleanup, "both samples should still be readable, got %d", count);
+
+cleanup:
+   pgexporter_history_records_free(out, count);
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_series_split_by_server_and_metric)
+{
+   struct history_record in[4];
+   time_t base = 4200000;
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_init(), 0, cleanup, "init failed");
+
+   make_record(&in[0], base, "primary", "pg_up", "server=\"primary\"", 1.0);
+   make_record(&in[1], base, "replica", "pg_up", "server=\"replica\"", 1.0);
+   make_record(&in[2], base, "primary", "pg_down", "server=\"primary\"", 0.0);
+   /* Same metric and labels as in[0], different server column. */
+   make_record(&in[3], base, "replica", "pg_up", "server=\"primary\"", 1.0);
+   MCTF_ASSERT_INT_EQ(pgexporter_history_write_batch(in, 4), 0, cleanup, "write failed");
+
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM series;"), 4, cleanup,
+                      "metric, server and label set must each separate a series");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_series_keeps_raw_labels)
+{
+   struct history_record in[1];
+   char labels[512];
+   time_t base = 4300000;
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_init(), 0, cleanup, "init failed");
+
+   make_record(&in[0], base, "primary", "pg_x", "server=\"primary\",database=\"pgbench\"", 1.0);
+   MCTF_ASSERT_INT_EQ(pgexporter_history_write_batch(in, 1), 0, cleanup, "write failed");
+
+   MCTF_ASSERT(db_text("SELECT labels FROM series;", labels, sizeof(labels)), cleanup, "no series row");
+   MCTF_ASSERT_STR_EQ(labels, "server=\"primary\",database=\"pgbench\"", cleanup,
+                      "the label string must be stored verbatim for display");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_sample_duplicate_last_wins)
+{
+   struct history_record in[2];
+   struct history_record* out = NULL;
+   int count = 0;
+   time_t base = 4400000;
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_init(), 0, cleanup, "init failed");
+
+   make_record(&in[0], base, "primary", "pg_up", "server=\"primary\"", 1.0);
+   make_record(&in[1], base, "primary", "pg_up", "server=\"primary\"", 9.0);
+   MCTF_ASSERT_INT_EQ(pgexporter_history_write_batch(in, 2), 0, cleanup, "write failed");
+
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM sample;"), 1, cleanup,
+                      "the same series at the same instant is one row");
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_query_range("pg_up", base, base, &out, &count), 0,
+                      cleanup, "query failed");
+   MCTF_ASSERT_INT_EQ(count, 1, cleanup, "expected 1 row, got %d", count);
+   MCTF_ASSERT(out[0].value == 9.0, cleanup, "the later write should win, got %f", out[0].value);
+
+cleanup:
+   pgexporter_history_records_free(out, count);
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_sample_no_orphans)
+{
+   struct history_record in[2];
+   time_t base = 4500000;
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_init(), 0, cleanup, "init failed");
+
+   make_record(&in[0], base, "primary", "pg_up", "server=\"primary\"", 1.0);
+   make_record(&in[1], base, "replica", "pg_up", "server=\"replica\"", 1.0);
+   MCTF_ASSERT_INT_EQ(pgexporter_history_write_batch(in, 2), 0, cleanup, "write failed");
+
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM sample WHERE series_id NOT IN (SELECT series_id FROM series);"),
+                      0, cleanup, "every sample must point at a series that exists");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+/* Pruning */
+MCTF_TEST(test_history_prune_sweeps_orphan_series)
+{
+   struct configuration* config = (struct configuration*)shmem;
+   struct history_record in[3];
+   time_t now = time(NULL);
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_init(), 0, cleanup, "init failed");
+
+   config->history_retention = PGEXPORTER_TIME_SEC(3600);
+
+   /* stale_series has nothing left after the cutoff; live_series does. */
+   make_record(&in[0], now - 7200, "primary", "stale_series", "server=\"primary\"", 1.0);
+   make_record(&in[1], now - 7200, "primary", "live_series", "server=\"primary\"", 2.0);
+   make_record(&in[2], now - 60, "primary", "live_series", "server=\"primary\"", 3.0);
+   MCTF_ASSERT_INT_EQ(pgexporter_history_write_batch(in, 3), 0, cleanup, "write failed");
+
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM series;"), 2, cleanup, "expected 2 series before prune");
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_prune(), 0, cleanup, "prune failed");
+
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM sample;"), 1, cleanup,
+                      "only the sample inside the retention window should remain");
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM series;"), 1, cleanup,
+                      "a series with no samples left is no longer a series");
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM series WHERE metric = 'live_series';"), 1, cleanup,
+                      "the series that still has samples must be kept");
+
+cleanup:
+   MCTF_FINISH();
+}
+
+MCTF_TEST(test_history_prune_keeps_series_reusable)
+{
+   struct configuration* config = (struct configuration*)shmem;
+   struct history_record in[1];
+   time_t now = time(NULL);
+
+   MCTF_ASSERT_INT_EQ(pgexporter_history_init(), 0, cleanup, "init failed");
+
+   config->history_retention = PGEXPORTER_TIME_SEC(3600);
+
+   make_record(&in[0], now - 7200, "primary", "pg_up", "server=\"primary\"", 1.0);
+   MCTF_ASSERT_INT_EQ(pgexporter_history_write_batch(in, 1), 0, cleanup, "write failed");
+   MCTF_ASSERT_INT_EQ(pgexporter_history_prune(), 0, cleanup, "prune failed");
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM series;"), 0, cleanup, "series should have been swept");
+
+   /* The next snapshot has to be able to recreate the series it just lost. */
+   make_record(&in[0], now, "primary", "pg_up", "server=\"primary\"", 2.0);
+   MCTF_ASSERT_INT_EQ(pgexporter_history_write_batch(in, 1), 0, cleanup, "write after sweep failed");
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM series;"), 1, cleanup, "series should have been recreated");
+   MCTF_ASSERT_INT_EQ((int)db_scalar("SELECT COUNT(*) FROM sample WHERE series_id NOT IN (SELECT series_id FROM series);"),
+                      0, cleanup, "the recreated sample must point at the new series");
 
 cleanup:
    MCTF_FINISH();

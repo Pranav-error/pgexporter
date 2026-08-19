@@ -52,7 +52,296 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <openssl/evp.h>
+
+/** Upper bound on the number of labels parsed from one exposition line. */
+#define HISTORY_LABEL_MAX 64
+
+/**
+ * @struct history_label
+ * @brief One parsed `key="value"` pair, pointing into the caller's string.
+ */
+struct history_label
+{
+   const char* key; /**< Start of the label name */
+   size_t key_len;  /**< Length of the label name */
+   const char* val; /**< Start of the label value, inside the quotes */
+   size_t val_len;  /**< Length of the label value, escapes left intact */
+};
+
 static const struct history_backend_ops* ops = NULL;
+
+static int
+label_compare(const void* a, const void* b)
+{
+   const struct history_label* la = (const struct history_label*)a;
+   const struct history_label* lb = (const struct history_label*)b;
+   size_t n = la->key_len < lb->key_len ? la->key_len : lb->key_len;
+   int c = memcmp(la->key, lb->key, n);
+
+   if (c != 0)
+   {
+      return c;
+   }
+
+   if (la->key_len != lb->key_len)
+   {
+      return la->key_len < lb->key_len ? -1 : 1;
+   }
+
+   n = la->val_len < lb->val_len ? la->val_len : lb->val_len;
+   c = memcmp(la->val, lb->val, n);
+
+   if (c != 0)
+   {
+      return c;
+   }
+
+   if (la->val_len == lb->val_len)
+   {
+      return 0;
+   }
+
+   return la->val_len < lb->val_len ? -1 : 1;
+}
+
+/**
+ * Parse a Prometheus label string into key/value pairs.
+ * A string carrying more than HISTORY_LABEL_MAX pairs is reported as
+ * malformed rather than truncated.
+ * @param labels The label string, or NULL
+ * @param out    Array of at least HISTORY_LABEL_MAX entries
+ * @param count  Set to the number of pairs parsed
+ * @return 0 on success, 1 if the string is not a well-formed label set
+ */
+static int
+label_parse(const char* labels, struct history_label* out, int* count)
+{
+   const char* p = labels;
+   int n = 0;
+
+   *count = 0;
+
+   if (labels == NULL)
+   {
+      return 0;
+   }
+
+   while (*p != '\0')
+   {
+      const char* key_start;
+      const char* val_start;
+      bool escaped = false;
+
+      while (*p == ' ' || *p == ',')
+      {
+         p++;
+      }
+
+      if (*p == '\0')
+      {
+         break;
+      }
+
+      key_start = p;
+      while (*p != '\0' && *p != '=')
+      {
+         p++;
+      }
+
+      if (*p != '=' || p == key_start)
+      {
+         goto error;
+      }
+
+      if (n == HISTORY_LABEL_MAX)
+      {
+         goto error;
+      }
+
+      out[n].key = key_start;
+      out[n].key_len = (size_t)(p - key_start);
+      p++;
+
+      if (*p != '"')
+      {
+         goto error;
+      }
+      p++;
+
+      val_start = p;
+      while (*p != '\0')
+      {
+         if (!escaped && *p == '"')
+         {
+            break;
+         }
+         escaped = (*p == '\\' && !escaped);
+         p++;
+      }
+
+      if (*p != '"')
+      {
+         goto error;
+      }
+
+      out[n].val = val_start;
+      out[n].val_len = (size_t)(p - val_start);
+      n++;
+      p++;
+
+      while (*p == ' ')
+      {
+         p++;
+      }
+
+      if (*p != '\0' && *p != ',')
+      {
+         goto error;
+      }
+   }
+
+   *count = n;
+   return 0;
+
+error:
+
+   *count = 0;
+   return 1;
+}
+
+bool
+pgexporter_history_label_find(const char* labels, const char* key, char* out, size_t out_size)
+{
+   struct history_label pairs[HISTORY_LABEL_MAX];
+   size_t key_len;
+   int count = 0;
+   int i;
+
+   if (out == NULL || out_size == 0)
+   {
+      return false;
+   }
+
+   out[0] = '\0';
+
+   if (labels == NULL || key == NULL)
+   {
+      return false;
+   }
+
+   if (label_parse(labels, pairs, &count))
+   {
+      return false;
+   }
+
+   key_len = strlen(key);
+
+   for (i = 0; i < count; i++)
+   {
+      if (pairs[i].key_len == key_len && memcmp(pairs[i].key, key, key_len) == 0)
+      {
+         size_t len = pairs[i].val_len;
+
+         if (len >= out_size)
+         {
+            len = out_size - 1;
+         }
+
+         memcpy(out, pairs[i].val, len);
+         out[len] = '\0';
+         return true;
+      }
+   }
+
+   return false;
+}
+
+int
+pgexporter_history_label_hash(const char* labels, char* out)
+{
+   struct history_label pairs[HISTORY_LABEL_MAX];
+   EVP_MD_CTX* ctx = NULL;
+   unsigned char digest[EVP_MAX_MD_SIZE];
+   unsigned int digest_len = 0;
+   int count = 0;
+   int i;
+
+   if (out == NULL)
+   {
+      goto error;
+   }
+
+   out[0] = '\0';
+
+   ctx = EVP_MD_CTX_new();
+   if (ctx == NULL)
+   {
+      goto error;
+   }
+
+   if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1)
+   {
+      goto error;
+   }
+
+   if (labels != NULL && label_parse(labels, pairs, &count))
+   {
+      /* Unrecognised label set: hash verbatim, still stable for this input */
+      if (EVP_DigestUpdate(ctx, labels, strlen(labels)) != 1)
+      {
+         goto error;
+      }
+   }
+   else
+   {
+      qsort(pairs, (size_t)count, sizeof(struct history_label), label_compare);
+
+      for (i = 0; i < count; i++)
+      {
+         if (EVP_DigestUpdate(ctx, pairs[i].key, pairs[i].key_len) != 1 ||
+             EVP_DigestUpdate(ctx, "=", 1) != 1 ||
+             EVP_DigestUpdate(ctx, pairs[i].val, pairs[i].val_len) != 1 ||
+             EVP_DigestUpdate(ctx, "\n", 1) != 1)
+         {
+            goto error;
+         }
+      }
+   }
+
+   if (EVP_DigestFinal_ex(ctx, digest, &digest_len) != 1)
+   {
+      goto error;
+   }
+
+   if (digest_len < HISTORY_LABEL_HASH_BYTES)
+   {
+      goto error;
+   }
+
+   for (i = 0; i < HISTORY_LABEL_HASH_BYTES; i++)
+   {
+      pgexporter_snprintf(out + (i * 2), 3, "%02x", digest[i]);
+   }
+
+   EVP_MD_CTX_free(ctx);
+
+   return 0;
+
+error:
+
+   if (ctx != NULL)
+   {
+      EVP_MD_CTX_free(ctx);
+   }
+
+   if (out != NULL)
+   {
+      out[0] = '\0';
+   }
+
+   return 1;
+}
 
 static const struct
 {
@@ -259,17 +548,8 @@ pgexporter_history_store_metrics(struct prometheus_metrics_container* container)
                         memcpy(labels, labels_start, labels_len);
                         labels[labels_len] = '\0';
 
-                        char* server_pos = strstr(labels, "server=\"");
-                        if (server_pos)
-                        {
-                           server_pos += 8;
-                           char* end_quote = strchr(server_pos, '"');
-                           if (end_quote)
-                           {
-                              size_t server_len = end_quote - server_pos;
-                              pgexporter_snprintf(server, sizeof(server), "%.*s", (int)server_len, server_pos);
-                           }
-                        }
+                        /* Same parser as the label hash: no false "server" match, no early quote end */
+                        pgexporter_history_label_find(labels, "server", server, sizeof(server));
                         p++;
                      }
                   }

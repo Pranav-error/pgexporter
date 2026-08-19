@@ -56,25 +56,59 @@ static sqlite3* db = NULL;
 /* Maximum free pages reclaimed per prune via PRAGMA incremental_vacuum */
 #define HISTORY_SQLITE_VACUUM_PAGES 1000
 
+/* sample is WITHOUT ROWID: nearly all key, halving space and write amplification */
+/* idx_sample_ts: the PK leads with series_id, but graphs and pruning read by ts */
+static const char* schema_sql =
+   "CREATE TABLE IF NOT EXISTS series ("
+   "series_id INTEGER PRIMARY KEY, "
+   "metric TEXT NOT NULL, "
+   "server TEXT NOT NULL DEFAULT '', "
+   "label_hash TEXT NOT NULL, "
+   "labels TEXT NOT NULL DEFAULT '', "
+   "UNIQUE (metric, server, label_hash)"
+   ");"
+   "CREATE TABLE IF NOT EXISTS sample ("
+   "series_id INTEGER NOT NULL REFERENCES series(series_id), "
+   "ts INTEGER NOT NULL, "
+   "value REAL NOT NULL, "
+   "PRIMARY KEY (series_id, ts)"
+   ") WITHOUT ROWID;"
+   "CREATE INDEX IF NOT EXISTS idx_sample_ts ON sample(ts);";
+
+/**
+ * Run a statement that returns no rows, logging on failure.
+ *
+ * @param sql   The SQL to execute
+ * @param what  Short description used in the log message
+ * @return 0 on success, 1 on failure
+ */
+static int
+exec_sql(const char* sql, const char* what)
+{
+   char* err_msg = NULL;
+
+   if (sqlite3_exec(db, sql, NULL, NULL, &err_msg) != SQLITE_OK)
+   {
+      pgexporter_log_error("history_sqlite: %s failed: %s", what, err_msg ? err_msg : sqlite3_errmsg(db));
+      if (err_msg)
+      {
+         sqlite3_free(err_msg);
+      }
+      return 1;
+   }
+
+   if (err_msg)
+   {
+      sqlite3_free(err_msg);
+   }
+
+   return 0;
+}
+
 int
 pgexporter_history_sqlite_init(void)
 {
    struct configuration* config;
-   char* err_msg = NULL;
-   const char* sql = "PRAGMA auto_vacuum=INCREMENTAL;"
-                     "PRAGMA journal_mode=WAL;"
-                     "PRAGMA busy_timeout=5000;"
-                     "CREATE TABLE IF NOT EXISTS history ("
-                     "ts INTEGER, "
-                     "server TEXT, "
-                     "metric TEXT, "
-                     "labels TEXT, "
-                     "value REAL"
-                     ");"
-                     /* Index covers both query_range (metric + ts range) and
-                      * prune (ts range), avoiding a full table scan. */
-                     "CREATE INDEX IF NOT EXISTS idx_history_metric_ts ON history(metric, ts);"
-                     "CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts);";
 
    if (db != NULL)
    {
@@ -92,25 +126,97 @@ pgexporter_history_sqlite_init(void)
    if (sqlite3_open_v2(config->history_path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) != SQLITE_OK)
    {
       pgexporter_log_error("history_sqlite: failed to open db %s: %s", config->history_path, db ? sqlite3_errmsg(db) : "out of memory");
-      if (db)
-      {
-         sqlite3_close(db);
-         db = NULL;
-      }
       goto error;
    }
 
-   if (sqlite3_exec(db, sql, 0, 0, &err_msg) != SQLITE_OK)
+   /* auto_vacuum must precede the first table to stick on a fresh file */
+   if (exec_sql("PRAGMA auto_vacuum=INCREMENTAL;"
+                "PRAGMA journal_mode=WAL;"
+                "PRAGMA busy_timeout=5000;"
+                "PRAGMA foreign_keys=ON;",
+                "pragma setup"))
    {
-      pgexporter_log_error("history_sqlite: failed to create table: %s", err_msg);
-      if (err_msg)
-      {
-         sqlite3_free(err_msg);
-      }
+      goto error;
+   }
+
+   if (exec_sql(schema_sql, "schema create"))
+   {
       goto error;
    }
 
    pgexporter_log_debug("history_sqlite: initialized at %s", config->history_path);
+   return 0;
+
+error:
+
+   if (db)
+   {
+      sqlite3_close_v2(db);
+      db = NULL;
+   }
+
+   return 1;
+}
+
+/**
+ * Resolve a record's series, inserting it the first time it is seen.
+ *
+ * @param record  The record whose metric/server/labels identify the series
+ * @param select  Prepared SELECT over the (metric, server, label_hash) unique index
+ * @param insert  Prepared INSERT into series
+ * @param out     Receives the series_id
+ * @return 0 on success, 1 on failure
+ */
+static int
+series_resolve(struct history_record* record, sqlite3_stmt* select, sqlite3_stmt* insert, sqlite3_int64* out)
+{
+   char label_hash[HISTORY_LABEL_HASH_LENGTH];
+   const char* labels = record->labels ? record->labels : "";
+   int rc;
+
+   if (pgexporter_history_label_hash(labels, label_hash))
+   {
+      pgexporter_log_error("history_sqlite: failed to hash labels for metric %s", record->metric);
+      goto error;
+   }
+
+   sqlite3_reset(select);
+   sqlite3_bind_text(select, 1, record->metric, -1, SQLITE_TRANSIENT);
+   sqlite3_bind_text(select, 2, record->server, -1, SQLITE_TRANSIENT);
+   sqlite3_bind_text(select, 3, label_hash, -1, SQLITE_TRANSIENT);
+
+   rc = sqlite3_step(select);
+
+   if (rc == SQLITE_ROW)
+   {
+      *out = sqlite3_column_int64(select, 0);
+      sqlite3_reset(select);
+      return 0;
+   }
+
+   if (rc != SQLITE_DONE)
+   {
+      pgexporter_log_error("history_sqlite: series lookup failed: %s", sqlite3_errmsg(db));
+      goto error;
+   }
+
+   sqlite3_reset(select);
+
+   sqlite3_reset(insert);
+   sqlite3_bind_text(insert, 1, record->metric, -1, SQLITE_TRANSIENT);
+   sqlite3_bind_text(insert, 2, record->server, -1, SQLITE_TRANSIENT);
+   sqlite3_bind_text(insert, 3, label_hash, -1, SQLITE_TRANSIENT);
+   sqlite3_bind_text(insert, 4, labels, -1, SQLITE_TRANSIENT);
+
+   if (sqlite3_step(insert) != SQLITE_DONE)
+   {
+      pgexporter_log_error("history_sqlite: series insert failed: %s", sqlite3_errmsg(db));
+      goto error;
+   }
+
+   sqlite3_reset(insert);
+   *out = sqlite3_last_insert_rowid(db);
+
    return 0;
 
 error:
@@ -121,8 +227,13 @@ error:
 int
 pgexporter_history_sqlite_write_batch(struct history_record* records, int count)
 {
-   sqlite3_stmt* stmt = NULL;
-   const char* sql = "INSERT INTO history(ts, server, metric, labels, value) VALUES(?, ?, ?, ?, ?);";
+   sqlite3_stmt* select_series = NULL;
+   sqlite3_stmt* insert_series = NULL;
+   sqlite3_stmt* insert_sample = NULL;
+   const char* select_series_sql = "SELECT series_id FROM series WHERE metric = ? AND server = ? AND label_hash = ?;";
+   const char* insert_series_sql = "INSERT INTO series(metric, server, label_hash, labels) VALUES(?, ?, ?, ?);";
+
+   const char* insert_sample_sql = "INSERT OR REPLACE INTO sample(series_id, ts, value) VALUES(?, ?, ?);";
    bool in_txn = false;
    int i;
 
@@ -131,13 +242,17 @@ pgexporter_history_sqlite_write_batch(struct history_record* records, int count)
       goto error;
    }
 
-   if (sqlite3_exec(db, "BEGIN TRANSACTION;", NULL, NULL, NULL) != SQLITE_OK)
+   /* IMMEDIATE: resolving a series reads before it writes, else SQLITE_BUSY_SNAPSHOT */
+   if (sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK)
    {
+      pgexporter_log_error("history_sqlite: begin failed: %s", sqlite3_errmsg(db));
       goto error;
    }
    in_txn = true;
 
-   if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+   if (sqlite3_prepare_v2(db, select_series_sql, -1, &select_series, NULL) != SQLITE_OK ||
+       sqlite3_prepare_v2(db, insert_series_sql, -1, &insert_series, NULL) != SQLITE_OK ||
+       sqlite3_prepare_v2(db, insert_sample_sql, -1, &insert_sample, NULL) != SQLITE_OK)
    {
       pgexporter_log_error("history_sqlite: prepare failed: %s", sqlite3_errmsg(db));
       goto error;
@@ -145,25 +260,35 @@ pgexporter_history_sqlite_write_batch(struct history_record* records, int count)
 
    for (i = 0; i < count; i++)
    {
-      sqlite3_bind_int64(stmt, 1, (sqlite3_int64)records[i].ts);
-      sqlite3_bind_text(stmt, 2, records[i].server, -1, SQLITE_TRANSIENT);
-      sqlite3_bind_text(stmt, 3, records[i].metric, -1, SQLITE_TRANSIENT);
-      sqlite3_bind_text(stmt, 4, records[i].labels ? records[i].labels : "", -1, SQLITE_TRANSIENT);
-      sqlite3_bind_double(stmt, 5, records[i].value);
+      sqlite3_int64 series_id = 0;
 
-      if (sqlite3_step(stmt) != SQLITE_DONE)
+      if (series_resolve(&records[i], select_series, insert_series, &series_id))
+      {
+         goto error;
+      }
+
+      sqlite3_reset(insert_sample);
+      sqlite3_bind_int64(insert_sample, 1, series_id);
+      sqlite3_bind_int64(insert_sample, 2, (sqlite3_int64)records[i].ts);
+      sqlite3_bind_double(insert_sample, 3, records[i].value);
+
+      if (sqlite3_step(insert_sample) != SQLITE_DONE)
       {
          pgexporter_log_error("history_sqlite: insert failed: %s", sqlite3_errmsg(db));
          goto error;
       }
-      sqlite3_reset(stmt);
    }
 
-   sqlite3_finalize(stmt);
-   stmt = NULL;
+   sqlite3_finalize(select_series);
+   select_series = NULL;
+   sqlite3_finalize(insert_series);
+   insert_series = NULL;
+   sqlite3_finalize(insert_sample);
+   insert_sample = NULL;
 
    if (sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK)
    {
+      pgexporter_log_error("history_sqlite: commit failed: %s", sqlite3_errmsg(db));
       goto error;
    }
 
@@ -171,9 +296,17 @@ pgexporter_history_sqlite_write_batch(struct history_record* records, int count)
 
 error:
 
-   if (stmt)
+   if (select_series)
    {
-      sqlite3_finalize(stmt);
+      sqlite3_finalize(select_series);
+   }
+   if (insert_series)
+   {
+      sqlite3_finalize(insert_series);
+   }
+   if (insert_sample)
+   {
+      sqlite3_finalize(insert_sample);
    }
 
    /* Only roll back if a transaction was actually started */
@@ -193,7 +326,10 @@ pgexporter_history_sqlite_query_range(const char* metric, time_t start, time_t e
                                       struct history_record** records_out, int* count_out)
 {
    sqlite3_stmt* stmt = NULL;
-   const char* sql = "SELECT ts, server, metric, labels, value FROM history WHERE metric = ? AND ts >= ? AND ts <= ? ORDER BY ts ASC;";
+   const char* sql = "SELECT sa.ts, se.server, se.metric, se.labels, sa.value "
+                     "FROM sample sa JOIN series se ON se.series_id = sa.series_id "
+                     "WHERE se.metric = ? AND sa.ts >= ? AND sa.ts <= ? "
+                     "ORDER BY sa.ts ASC;";
    int count = 0;
    int capacity = 100;
    struct history_record* results = NULL;
@@ -302,7 +438,9 @@ pgexporter_history_sqlite_prune(void)
 {
    struct configuration* config;
    sqlite3_stmt* stmt = NULL;
-   const char* sql = "DELETE FROM history WHERE ts < ?;";
+   const char* sql = "DELETE FROM sample WHERE ts < ?;";
+   const char* sweep_sql = "DELETE FROM series WHERE NOT EXISTS ("
+                           "SELECT 1 FROM sample WHERE sample.series_id = series.series_id);";
    char vacuum_sql[48];
    time_t cutoff;
    int64_t retention_s;
@@ -321,6 +459,7 @@ pgexporter_history_sqlite_prune(void)
    }
 
    cutoff = time(NULL) - (time_t)retention_s;
+
    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
    {
       pgexporter_log_error("history_sqlite: prune prepare failed: %s", sqlite3_errmsg(db));
@@ -337,6 +476,12 @@ pgexporter_history_sqlite_prune(void)
 
    sqlite3_finalize(stmt);
    stmt = NULL;
+
+   /* Separate lock: the sweep re-checks NOT EXISTS, so an insert in between is safe */
+   if (exec_sql(sweep_sql, "orphan series sweep"))
+   {
+      goto error;
+   }
 
    /* Hand reclaimed pages back to the OS. Bounded so the write lock is held
     * only briefly; a no-op when auto_vacuum freed nothing. */

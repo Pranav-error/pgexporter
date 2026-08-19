@@ -35,10 +35,20 @@ extern "C" {
 
 #include <pgexporter.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <time.h>
 
 #include <openssl/ssl.h>
+
+/** Bytes of the SHA-256 digest used for the canonical label hash: the full 256. */
+#define HISTORY_LABEL_HASH_BYTES 32
+
+/**
+ * Length of the canonical label hash rendered as lowercase hex, including the
+ * terminating NUL.
+ */
+#define HISTORY_LABEL_HASH_LENGTH ((HISTORY_LABEL_HASH_BYTES * 2) + 1)
 
 /**
  * @struct history_record
@@ -54,6 +64,33 @@ struct history_record
                                         the whole array with pgexporter_history_records_free(). */
    double value;                   /**< Metric value */
 };
+
+/**
+ * Compute the canonical hash of a Prometheus label set.
+ *
+ * The label string is the text between the braces of an exposition line, for
+ * example `server="primary",database="postgres"`. Pairs are sorted by key
+ * before hashing, so emission order does not change a series' identity.
+ * Input that does not parse is hashed verbatim, which is still stable.
+ *
+ * @param labels The label string, or NULL/empty for a series with no labels
+ * @param out    Buffer of at least HISTORY_LABEL_HASH_LENGTH bytes
+ * @return 0 on success, 1 on failure
+ */
+int
+pgexporter_history_label_hash(const char* labels, char* out);
+
+/**
+ * Look up one label's value in a Prometheus label string.
+ *
+ * @param labels   The label string, or NULL
+ * @param key      The label name to find
+ * @param out      Buffer receiving the value, NUL-terminated and truncated to fit
+ * @param out_size Size of out in bytes
+ * @return true if the key was found, otherwise false
+ */
+bool
+pgexporter_history_label_find(const char* labels, const char* key, char* out, size_t out_size);
 
 /**
  * Free an array of history records returned by pgexporter_history_query_range,

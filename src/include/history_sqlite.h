@@ -67,7 +67,9 @@ pgexporter_history_sqlite_query_range(const char* metric, time_t start, time_t e
                                       struct history_record** records_out, int* count_out);
 
 /**
- * Delete records whose timestamp is older than config->history_retention.
+ * Delete samples whose timestamp is older than config->history_retention, then
+ * remove any series left with no samples at all.
+ *
  * @return 0 on success, 1 on failure
  */
 int
