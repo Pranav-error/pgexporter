@@ -30,6 +30,7 @@
 #include <pgexporter.h>
 #include <deque.h>
 #include <history.h>
+#include <history_postgresql.h>
 #include <history_sqlite.h>
 #include <http.h>
 #include <http_server.h>
@@ -349,6 +350,7 @@ static const struct
    const struct history_backend_ops* ops;
 } backend_registry[] = {
    {HISTORY_BACKEND_SQLITE, &pgexporter_history_sqlite_ops},
+   {HISTORY_BACKEND_POSTGRESQL, &pgexporter_history_postgresql_ops},
 };
 
 #define BACKEND_REGISTRY_SIZE (sizeof(backend_registry) / sizeof(backend_registry[0]))

@@ -85,6 +85,7 @@ static int as_logging_level(char* str);
 static int as_logging_mode(char* str);
 static int as_hugepage(char* str);
 static int as_history_backend(char* str);
+static int as_tls_mode(char* str, int* mode);
 static ev_backend_t as_ev_backend(char* str);
 static int as_server_type(char* str);
 static int as_update_process_title(char* str);
@@ -148,6 +149,17 @@ pgexporter_init_configuration(void* shm)
    memset(config->history_cert_file, 0, MAX_PATH);
    memset(config->history_key_file, 0, MAX_PATH);
    memset(config->history_ca_file, 0, MAX_PATH);
+
+   memset(config->history_postgresql_host, 0, MISC_LENGTH);
+   config->history_postgresql_port = 5432;
+   pgexporter_snprintf(config->history_postgresql_database, MISC_LENGTH, "%s", "pgexporter_history");
+   memset(config->history_postgresql_user, 0, MAX_USERNAME_LENGTH);
+   memset(config->history_postgresql_password_file, 0, MAX_PATH);
+   config->history_postgresql_tls = SERVER_TLS_OFF;
+   memset(config->history_postgresql_tls_cert_file, 0, MAX_PATH);
+   memset(config->history_postgresql_tls_key_file, 0, MAX_PATH);
+   memset(config->history_postgresql_tls_ca_file, 0, MAX_PATH);
+   memset(&config->history_user, 0, sizeof(struct user));
 
    config->bridge = -1;
    config->bridge_cache_max_age = PGEXPORTER_TIME_SEC(300);
@@ -319,7 +331,7 @@ pgexporter_read_configuration(void* shm, char* filename)
          }
          else
          {
-            if (pgexporter_starts_with(line, "unix_socket_dir") || pgexporter_starts_with(line, "metrics_path") || pgexporter_starts_with(line, "alerts_path") || pgexporter_starts_with(line, "log_path") || pgexporter_starts_with(line, "tls_cert_file") || pgexporter_starts_with(line, "tls_key_file") || pgexporter_starts_with(line, "tls_ca_file") || pgexporter_starts_with(line, "metrics_cert_file") || pgexporter_starts_with(line, "metrics_key_file") || pgexporter_starts_with(line, "metrics_ca_file") || pgexporter_starts_with(line, "history_cert_file") || pgexporter_starts_with(line, "history_key_file") || pgexporter_starts_with(line, "history_ca_file") || pgexporter_starts_with(line, "console_cert_file") || pgexporter_starts_with(line, "console_key_file") || pgexporter_starts_with(line, "console_ca_file") || pgexporter_starts_with(line, "bridge_cert_file") || pgexporter_starts_with(line, "bridge_key_file") || pgexporter_starts_with(line, "bridge_ca_file") || pgexporter_starts_with(line, "scrape_ca_file") || pgexporter_starts_with(line, "scrape_cert_file") || pgexporter_starts_with(line, "scrape_key_file"))
+            if (pgexporter_starts_with(line, "unix_socket_dir") || pgexporter_starts_with(line, "metrics_path") || pgexporter_starts_with(line, "alerts_path") || pgexporter_starts_with(line, "log_path") || pgexporter_starts_with(line, "tls_cert_file") || pgexporter_starts_with(line, "tls_key_file") || pgexporter_starts_with(line, "tls_ca_file") || pgexporter_starts_with(line, "metrics_cert_file") || pgexporter_starts_with(line, "metrics_key_file") || pgexporter_starts_with(line, "metrics_ca_file") || pgexporter_starts_with(line, "history_cert_file") || pgexporter_starts_with(line, "history_key_file") || pgexporter_starts_with(line, "history_ca_file") || pgexporter_starts_with(line, "history_postgresql_password_file") || pgexporter_starts_with(line, "history_postgresql_tls_cert_file") || pgexporter_starts_with(line, "history_postgresql_tls_key_file") || pgexporter_starts_with(line, "history_postgresql_tls_ca_file") || pgexporter_starts_with(line, "console_cert_file") || pgexporter_starts_with(line, "console_key_file") || pgexporter_starts_with(line, "console_ca_file") || pgexporter_starts_with(line, "bridge_cert_file") || pgexporter_starts_with(line, "bridge_key_file") || pgexporter_starts_with(line, "bridge_ca_file") || pgexporter_starts_with(line, "scrape_ca_file") || pgexporter_starts_with(line, "scrape_cert_file") || pgexporter_starts_with(line, "scrape_key_file"))
             {
                extract_syskey_value(line, &key, &value);
             }
@@ -682,6 +694,153 @@ pgexporter_read_configuration(void* shm, char* filename)
                      unknown = true;
                   }
                }
+               else if (!strcmp(key, "history_postgresql_host"))
+               {
+                  if (!strcmp(section, "pgexporter"))
+                  {
+                     max = strlen(value);
+                     if (max > MISC_LENGTH - 1)
+                     {
+                        max = MISC_LENGTH - 1;
+                     }
+                     memset(config->history_postgresql_host, 0, sizeof(config->history_postgresql_host));
+                     memcpy(config->history_postgresql_host, value, max);
+                  }
+                  else
+                  {
+                     unknown = true;
+                  }
+               }
+               else if (!strcmp(key, "history_postgresql_port"))
+               {
+                  if (!strcmp(section, "pgexporter"))
+                  {
+                     if (as_int(value, &config->history_postgresql_port))
+                     {
+                        unknown = true;
+                     }
+                  }
+                  else
+                  {
+                     unknown = true;
+                  }
+               }
+               else if (!strcmp(key, "history_postgresql_database"))
+               {
+                  if (!strcmp(section, "pgexporter"))
+                  {
+                     max = strlen(value);
+                     if (max > MISC_LENGTH - 1)
+                     {
+                        max = MISC_LENGTH - 1;
+                     }
+                     memset(config->history_postgresql_database, 0, sizeof(config->history_postgresql_database));
+                     memcpy(config->history_postgresql_database, value, max);
+                  }
+                  else
+                  {
+                     unknown = true;
+                  }
+               }
+               else if (!strcmp(key, "history_postgresql_user"))
+               {
+                  if (!strcmp(section, "pgexporter"))
+                  {
+                     max = strlen(value);
+                     if (max > MAX_USERNAME_LENGTH - 1)
+                     {
+                        max = MAX_USERNAME_LENGTH - 1;
+                     }
+                     memset(config->history_postgresql_user, 0, sizeof(config->history_postgresql_user));
+                     memcpy(config->history_postgresql_user, value, max);
+                  }
+                  else
+                  {
+                     unknown = true;
+                  }
+               }
+               else if (!strcmp(key, "history_postgresql_password_file"))
+               {
+                  if (!strcmp(section, "pgexporter"))
+                  {
+                     max = strlen(value);
+                     if (max > MAX_PATH - 1)
+                     {
+                        max = MAX_PATH - 1;
+                     }
+                     memset(config->history_postgresql_password_file, 0, sizeof(config->history_postgresql_password_file));
+                     memcpy(config->history_postgresql_password_file, value, max);
+                  }
+                  else
+                  {
+                     unknown = true;
+                  }
+               }
+               else if (!strcmp(key, "history_postgresql_tls"))
+               {
+                  if (!strcmp(section, "pgexporter"))
+                  {
+                     if (as_tls_mode(value, &config->history_postgresql_tls))
+                     {
+                        unknown = true;
+                     }
+                  }
+                  else
+                  {
+                     unknown = true;
+                  }
+               }
+               else if (!strcmp(key, "history_postgresql_tls_cert_file"))
+               {
+                  if (!strcmp(section, "pgexporter"))
+                  {
+                     max = strlen(value);
+                     if (max > MAX_PATH - 1)
+                     {
+                        max = MAX_PATH - 1;
+                     }
+                     memset(config->history_postgresql_tls_cert_file, 0, sizeof(config->history_postgresql_tls_cert_file));
+                     memcpy(config->history_postgresql_tls_cert_file, value, max);
+                  }
+                  else
+                  {
+                     unknown = true;
+                  }
+               }
+               else if (!strcmp(key, "history_postgresql_tls_key_file"))
+               {
+                  if (!strcmp(section, "pgexporter"))
+                  {
+                     max = strlen(value);
+                     if (max > MAX_PATH - 1)
+                     {
+                        max = MAX_PATH - 1;
+                     }
+                     memset(config->history_postgresql_tls_key_file, 0, sizeof(config->history_postgresql_tls_key_file));
+                     memcpy(config->history_postgresql_tls_key_file, value, max);
+                  }
+                  else
+                  {
+                     unknown = true;
+                  }
+               }
+               else if (!strcmp(key, "history_postgresql_tls_ca_file"))
+               {
+                  if (!strcmp(section, "pgexporter"))
+                  {
+                     max = strlen(value);
+                     if (max > MAX_PATH - 1)
+                     {
+                        max = MAX_PATH - 1;
+                     }
+                     memset(config->history_postgresql_tls_ca_file, 0, sizeof(config->history_postgresql_tls_ca_file));
+                     memcpy(config->history_postgresql_tls_ca_file, value, max);
+                  }
+                  else
+                  {
+                     unknown = true;
+                  }
+               }
                else if (!strcmp(key, "history_cert_file"))
                {
                   if (!strcmp(section, "pgexporter"))
@@ -858,19 +1017,7 @@ pgexporter_read_configuration(void* shm, char* filename)
                   }
                   else
                   {
-                     if (!strcmp(value, "off"))
-                     {
-                        srv.tls_mode = SERVER_TLS_OFF;
-                     }
-                     else if (!strcmp(value, "try"))
-                     {
-                        srv.tls_mode = SERVER_TLS_TRY;
-                     }
-                     else if (!strcmp(value, "on"))
-                     {
-                        srv.tls_mode = SERVER_TLS_ON;
-                     }
-                     else
+                     if (as_tls_mode(value, &srv.tls_mode))
                      {
                         unknown = true;
                      }
@@ -1711,6 +1858,33 @@ pgexporter_validate_configuration(void* shm)
    {
       pgexporter_log_fatal("pgexporter: Invalid bridge_history_backend");
       return 1;
+   }
+
+   /* The backend's own required settings, checked only when history is enabled */
+   if (config->history > 0)
+   {
+      if (config->history_backend == HISTORY_BACKEND_POSTGRESQL)
+      {
+         if (strlen(config->history_postgresql_host) == 0)
+         {
+            pgexporter_log_fatal("pgexporter: history_backend is postgresql but history_postgresql_host is not set");
+            return 1;
+         }
+
+         if (strlen(config->history_postgresql_database) == 0)
+         {
+            pgexporter_log_fatal("pgexporter: history_backend is postgresql but history_postgresql_database is not set");
+            return 1;
+         }
+
+         /* tls=on needs a CA to verify against, same rule the servers use */
+         if (config->history_postgresql_tls == SERVER_TLS_ON &&
+             strlen(config->history_postgresql_tls_ca_file) == 0)
+         {
+            pgexporter_log_fatal("pgexporter: history_postgresql_tls is on but history_postgresql_tls_ca_file is not set");
+            return 1;
+         }
+      }
    }
 
    if (strlen(config->metrics_cert_file) > 0)
@@ -2644,6 +2818,24 @@ get_config_value_str(char* buf, size_t size, struct configuration* cfg, char* ke
       to_history_backend(buf, cfg->history_backend);
    else if (!strcmp(key, "history_path"))
       pgexporter_snprintf(buf, size, "%s", cfg->history_path);
+   else if (!strcmp(key, "history_postgresql_host"))
+      pgexporter_snprintf(buf, size, "%s", cfg->history_postgresql_host);
+   else if (!strcmp(key, "history_postgresql_port"))
+      pgexporter_snprintf(buf, size, "%d", cfg->history_postgresql_port);
+   else if (!strcmp(key, "history_postgresql_database"))
+      pgexporter_snprintf(buf, size, "%s", cfg->history_postgresql_database);
+   else if (!strcmp(key, "history_postgresql_user"))
+      pgexporter_snprintf(buf, size, "%s", cfg->history_postgresql_user);
+   else if (!strcmp(key, "history_postgresql_password_file"))
+      pgexporter_snprintf(buf, size, "%s", cfg->history_postgresql_password_file);
+   else if (!strcmp(key, "history_postgresql_tls"))
+      to_server_tls_mode(buf, cfg->history_postgresql_tls);
+   else if (!strcmp(key, "history_postgresql_tls_cert_file"))
+      pgexporter_snprintf(buf, size, "%s", cfg->history_postgresql_tls_cert_file);
+   else if (!strcmp(key, "history_postgresql_tls_key_file"))
+      pgexporter_snprintf(buf, size, "%s", cfg->history_postgresql_tls_key_file);
+   else if (!strcmp(key, "history_postgresql_tls_ca_file"))
+      pgexporter_snprintf(buf, size, "%s", cfg->history_postgresql_tls_ca_file);
    else if (!strcmp(key, "bridge"))
       pgexporter_snprintf(buf, size, "%d", cfg->bridge);
    else if (!strcmp(key, "bridge_endpoints"))
@@ -2782,6 +2974,16 @@ copy_configuration_values(struct configuration* dst, struct configuration* src)
    dst->history_retention = src->history_retention;
    dst->history_backend = src->history_backend;
    memcpy(dst->history_path, src->history_path, MAX_PATH);
+
+   memcpy(dst->history_postgresql_host, src->history_postgresql_host, MISC_LENGTH);
+   dst->history_postgresql_port = src->history_postgresql_port;
+   memcpy(dst->history_postgresql_database, src->history_postgresql_database, MISC_LENGTH);
+   memcpy(dst->history_postgresql_user, src->history_postgresql_user, MAX_USERNAME_LENGTH);
+   memcpy(dst->history_postgresql_password_file, src->history_postgresql_password_file, MAX_PATH);
+   dst->history_postgresql_tls = src->history_postgresql_tls;
+   memcpy(dst->history_postgresql_tls_cert_file, src->history_postgresql_tls_cert_file, MAX_PATH);
+   memcpy(dst->history_postgresql_tls_key_file, src->history_postgresql_tls_key_file, MAX_PATH);
+   memcpy(dst->history_postgresql_tls_ca_file, src->history_postgresql_tls_ca_file, MAX_PATH);
 
    dst->bridge = src->bridge;
    dst->bridge_cache_max_age = src->bridge_cache_max_age;
@@ -3284,6 +3486,99 @@ pgexporter_conf_set(SSL* ssl __attribute__((unused)), int client_fd, uint8_t com
          config->history_path[max] = '\0';
          pgexporter_json_put(response, key, (uintptr_t)config->history_path, ValueString);
       }
+      else if (!strcmp(key, "history_postgresql_host"))
+      {
+         max = strlen(config_value);
+         if (max > MISC_LENGTH - 1)
+         {
+            max = MISC_LENGTH - 1;
+         }
+         memcpy(config->history_postgresql_host, config_value, max);
+         config->history_postgresql_host[max] = '\0';
+         pgexporter_json_put(response, key, (uintptr_t)config->history_postgresql_host, ValueString);
+      }
+      else if (!strcmp(key, "history_postgresql_port"))
+      {
+         if (as_int(config_value, &config->history_postgresql_port))
+         {
+            invalid_value = true;
+         }
+         pgexporter_json_put(response, key, (uintptr_t)config->history_postgresql_port, ValueInt64);
+      }
+      else if (!strcmp(key, "history_postgresql_database"))
+      {
+         max = strlen(config_value);
+         if (max > MISC_LENGTH - 1)
+         {
+            max = MISC_LENGTH - 1;
+         }
+         memcpy(config->history_postgresql_database, config_value, max);
+         config->history_postgresql_database[max] = '\0';
+         pgexporter_json_put(response, key, (uintptr_t)config->history_postgresql_database, ValueString);
+      }
+      else if (!strcmp(key, "history_postgresql_user"))
+      {
+         max = strlen(config_value);
+         if (max > MAX_USERNAME_LENGTH - 1)
+         {
+            max = MAX_USERNAME_LENGTH - 1;
+         }
+         memcpy(config->history_postgresql_user, config_value, max);
+         config->history_postgresql_user[max] = '\0';
+         pgexporter_json_put(response, key, (uintptr_t)config->history_postgresql_user, ValueString);
+      }
+      else if (!strcmp(key, "history_postgresql_password_file"))
+      {
+         max = strlen(config_value);
+         if (max > MAX_PATH - 1)
+         {
+            max = MAX_PATH - 1;
+         }
+         memcpy(config->history_postgresql_password_file, config_value, max);
+         config->history_postgresql_password_file[max] = '\0';
+         pgexporter_json_put(response, key, (uintptr_t)config->history_postgresql_password_file, ValueString);
+      }
+      else if (!strcmp(key, "history_postgresql_tls"))
+      {
+         if (as_tls_mode(config_value, &config->history_postgresql_tls))
+         {
+            invalid_value = true;
+         }
+         pgexporter_json_put(response, key, (uintptr_t)config->history_postgresql_tls, ValueInt32);
+      }
+      else if (!strcmp(key, "history_postgresql_tls_cert_file"))
+      {
+         max = strlen(config_value);
+         if (max > MAX_PATH - 1)
+         {
+            max = MAX_PATH - 1;
+         }
+         memcpy(config->history_postgresql_tls_cert_file, config_value, max);
+         config->history_postgresql_tls_cert_file[max] = '\0';
+         pgexporter_json_put(response, key, (uintptr_t)config->history_postgresql_tls_cert_file, ValueString);
+      }
+      else if (!strcmp(key, "history_postgresql_tls_key_file"))
+      {
+         max = strlen(config_value);
+         if (max > MAX_PATH - 1)
+         {
+            max = MAX_PATH - 1;
+         }
+         memcpy(config->history_postgresql_tls_key_file, config_value, max);
+         config->history_postgresql_tls_key_file[max] = '\0';
+         pgexporter_json_put(response, key, (uintptr_t)config->history_postgresql_tls_key_file, ValueString);
+      }
+      else if (!strcmp(key, "history_postgresql_tls_ca_file"))
+      {
+         max = strlen(config_value);
+         if (max > MAX_PATH - 1)
+         {
+            max = MAX_PATH - 1;
+         }
+         memcpy(config->history_postgresql_tls_ca_file, config_value, max);
+         config->history_postgresql_tls_ca_file[max] = '\0';
+         pgexporter_json_put(response, key, (uintptr_t)config->history_postgresql_tls_ca_file, ValueString);
+      }
       else if (!strcmp(key, "bridge_history"))
       {
          if (as_int(config_value, &config->bridge_history))
@@ -3354,19 +3649,7 @@ pgexporter_conf_set(SSL* ssl __attribute__((unused)), int client_fd, uint8_t com
       {
          if (strlen(section) > 0)
          {
-            if (!strcmp(config_value, "off"))
-            {
-               config->servers[server_index].tls_mode = SERVER_TLS_OFF;
-            }
-            else if (!strcmp(config_value, "try"))
-            {
-               config->servers[server_index].tls_mode = SERVER_TLS_TRY;
-            }
-            else if (!strcmp(config_value, "on"))
-            {
-               config->servers[server_index].tls_mode = SERVER_TLS_ON;
-            }
-            else
+            if (as_tls_mode(config_value, &config->servers[server_index].tls_mode))
             {
                invalid_value = true;
             }
@@ -3995,6 +4278,15 @@ add_configuration_response(struct json* res)
    pgexporter_json_put_time_value(res, CONFIGURATION_ARGUMENT_HISTORY_RETENTION, config->history_retention, FORMAT_TIME_S);
    pgexporter_json_put_enum_value(res, CONFIGURATION_ARGUMENT_HISTORY_BACKEND, config->history_backend, to_history_backend);
    pgexporter_json_put(res, CONFIGURATION_ARGUMENT_HISTORY_PATH, (uintptr_t)config->history_path, ValueString);
+   pgexporter_json_put(res, CONFIGURATION_ARGUMENT_HISTORY_PG_HOST, (uintptr_t)config->history_postgresql_host, ValueString);
+   pgexporter_json_put(res, CONFIGURATION_ARGUMENT_HISTORY_PG_PORT, (uintptr_t)config->history_postgresql_port, ValueInt64);
+   pgexporter_json_put(res, CONFIGURATION_ARGUMENT_HISTORY_PG_DATABASE, (uintptr_t)config->history_postgresql_database, ValueString);
+   pgexporter_json_put(res, CONFIGURATION_ARGUMENT_HISTORY_PG_USER, (uintptr_t)config->history_postgresql_user, ValueString);
+   pgexporter_json_put(res, CONFIGURATION_ARGUMENT_HISTORY_PG_PASSWORD_FILE, (uintptr_t)config->history_postgresql_password_file, ValueString);
+   pgexporter_json_put_enum_value(res, CONFIGURATION_ARGUMENT_HISTORY_PG_TLS, config->history_postgresql_tls, to_server_tls_mode);
+   pgexporter_json_put(res, CONFIGURATION_ARGUMENT_HISTORY_PG_TLS_CERT_FILE, (uintptr_t)config->history_postgresql_tls_cert_file, ValueString);
+   pgexporter_json_put(res, CONFIGURATION_ARGUMENT_HISTORY_PG_TLS_KEY_FILE, (uintptr_t)config->history_postgresql_tls_key_file, ValueString);
+   pgexporter_json_put(res, CONFIGURATION_ARGUMENT_HISTORY_PG_TLS_CA_FILE, (uintptr_t)config->history_postgresql_tls_ca_file, ValueString);
    pgexporter_json_put(res, CONFIGURATION_ARGUMENT_BRIDGE_HISTORY, (uintptr_t)config->bridge_history, ValueInt64);
    pgexporter_json_put_time_value(res, CONFIGURATION_ARGUMENT_BRIDGE_HISTORY_INTERVAL, config->bridge_history_interval, FORMAT_TIME_S);
    pgexporter_json_put_time_value(res, CONFIGURATION_ARGUMENT_BRIDGE_HISTORY_RETENTION, config->bridge_history_retention, FORMAT_TIME_S);
@@ -4562,7 +4854,37 @@ as_history_backend(char* str)
       return HISTORY_BACKEND_SQLITE;
    }
 
-   return HISTORY_BACKEND_SQLITE;
+   if (!strcasecmp(str, "postgresql"))
+   {
+      return HISTORY_BACKEND_POSTGRESQL;
+   }
+
+   /* Negative signals an unrecognised value to the callers' < 0 checks */
+   return -1;
+}
+
+static int
+as_tls_mode(char* str, int* mode)
+{
+   if (!strcmp(str, "off"))
+   {
+      *mode = SERVER_TLS_OFF;
+      return 0;
+   }
+
+   if (!strcmp(str, "try"))
+   {
+      *mode = SERVER_TLS_TRY;
+      return 0;
+   }
+
+   if (!strcmp(str, "on"))
+   {
+      *mode = SERVER_TLS_ON;
+      return 0;
+   }
+
+   return 1;
 }
 
 static ev_backend_t
@@ -5204,6 +5526,49 @@ check_restart_required(struct configuration* config, struct configuration* reloa
       restart = true;
    }
 
+   /* The history store connection is established once per worker, so a change
+    * only takes effect on restart */
+   if (restart_int("history_backend", config->history_backend, reload->history_backend))
+   {
+      restart = true;
+   }
+   if (restart_string("history_postgresql_host", config->history_postgresql_host, reload->history_postgresql_host))
+   {
+      restart = true;
+   }
+   if (restart_int("history_postgresql_port", config->history_postgresql_port, reload->history_postgresql_port))
+   {
+      restart = true;
+   }
+   if (restart_string("history_postgresql_database", config->history_postgresql_database, reload->history_postgresql_database))
+   {
+      restart = true;
+   }
+   if (restart_string("history_postgresql_user", config->history_postgresql_user, reload->history_postgresql_user))
+   {
+      restart = true;
+   }
+   if (restart_string("history_postgresql_password_file", config->history_postgresql_password_file, reload->history_postgresql_password_file))
+   {
+      restart = true;
+   }
+   if (restart_int("history_postgresql_tls", config->history_postgresql_tls, reload->history_postgresql_tls))
+   {
+      restart = true;
+   }
+   if (restart_string("history_postgresql_tls_cert_file", config->history_postgresql_tls_cert_file, reload->history_postgresql_tls_cert_file))
+   {
+      restart = true;
+   }
+   if (restart_string("history_postgresql_tls_key_file", config->history_postgresql_tls_key_file, reload->history_postgresql_tls_key_file))
+   {
+      restart = true;
+   }
+   if (restart_string("history_postgresql_tls_ca_file", config->history_postgresql_tls_ca_file, reload->history_postgresql_tls_ca_file))
+   {
+      restart = true;
+   }
+
    /* Check if number of servers decreased */
    if (config->number_of_servers > reload->number_of_servers)
    {
@@ -5314,6 +5679,16 @@ transfer_configuration(struct configuration* config, struct configuration* reloa
    config->history_retention = reload->history_retention;
    config->history_backend = reload->history_backend;
    memcpy(config->history_path, reload->history_path, MAX_PATH);
+
+   memcpy(config->history_postgresql_host, reload->history_postgresql_host, MISC_LENGTH);
+   config->history_postgresql_port = reload->history_postgresql_port;
+   memcpy(config->history_postgresql_database, reload->history_postgresql_database, MISC_LENGTH);
+   memcpy(config->history_postgresql_user, reload->history_postgresql_user, MAX_USERNAME_LENGTH);
+   memcpy(config->history_postgresql_password_file, reload->history_postgresql_password_file, MAX_PATH);
+   config->history_postgresql_tls = reload->history_postgresql_tls;
+   memcpy(config->history_postgresql_tls_cert_file, reload->history_postgresql_tls_cert_file, MAX_PATH);
+   memcpy(config->history_postgresql_tls_key_file, reload->history_postgresql_tls_key_file, MAX_PATH);
+   memcpy(config->history_postgresql_tls_ca_file, reload->history_postgresql_tls_ca_file, MAX_PATH);
 
    /* Bridge history */
    config->bridge_history = reload->bridge_history;
@@ -5820,6 +6195,9 @@ to_history_backend(char* where, int value)
    {
       case HISTORY_BACKEND_SQLITE:
          pgexporter_snprintf(where, MISC_LENGTH, "%s", "sqlite");
+         break;
+      case HISTORY_BACKEND_POSTGRESQL:
+         pgexporter_snprintf(where, MISC_LENGTH, "%s", "postgresql");
          break;
       default:
          return 1;

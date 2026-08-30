@@ -75,9 +75,10 @@ The maximum supported interval is approximately **24.8 days**. Larger values are
 The storage backend is selected with `history_backend` (or `bridge_history_backend`
 for bridge history). The currently supported backends are:
 
-| Backend | Value    | Description |
-|---------|----------|-------------|
-| SQLite  | `sqlite` | Default. Local file-based storage. |
+| Backend    | Value        | Description |
+|------------|--------------|-------------|
+| SQLite     | `sqlite`     | Default. Local file-based storage. |
+| PostgreSQL | `postgresql` | Stores history in a PostgreSQL database. |
 
 ### SQLite
 
@@ -94,6 +95,58 @@ following hardcoded settings:
   After each prune, up to 1000 free pages are returned to the operating system
   with `PRAGMA incremental_vacuum`, keeping the database file from growing
   unbounded while never holding the write lock for long.
+
+### PostgreSQL
+
+The PostgreSQL backend stores history in a PostgreSQL database instead of a local
+file, so the history can be shared, backed up alongside your other databases, and
+queried directly.
+
+```ini
+[pgexporter]
+
+history_backend                  = postgresql
+history_postgresql_host          = history.example.com
+history_postgresql_port          = 5432
+history_postgresql_database      = pgexporter_history
+history_postgresql_user          = pgexporter
+history_postgresql_password_file = /etc/pgexporter/pgexporter_history.conf
+history_postgresql_tls           = on
+history_postgresql_tls_ca_file   = /path/to/ca.crt
+```
+
+`history_postgresql_host` may be a directory rather than a hostname, in which case
+it is treated as the location of a Unix domain socket and `history_postgresql_port`
+selects the socket file.
+
+The credential lives in its own encrypted file rather than in
+`pgexporter_users.conf`, managed with the same tool:
+
+```sh
+pgexporter-admin -f /etc/pgexporter/pgexporter_history.conf -U pgexporter user add
+```
+
+#### Privileges
+
+pgexporter creates and owns its own schema in the database it is pointed at, so the
+role needs `CREATE` on that database as well as `CONNECT`. Because the tables are
+then owned by that role, no further grants are needed - it can read, write and
+prune its own objects.
+
+```sql
+CREATE DATABASE pgexporter_history;
+CREATE USER pgexporter WITH PASSWORD 'secret';
+GRANT CONNECT, CREATE ON DATABASE pgexporter_history TO pgexporter;
+```
+
+Creating the schema at startup is also why a dedicated database is recommended
+rather than reusing an application database: `CREATE` on a database is a broad
+privilege, and confining it to a database that holds nothing else keeps the blast
+radius small.
+
+The role does **not** need `pg_monitor`. That is a requirement of the roles used to
+scrape monitored servers — pgexporter refuses to start when one of those lacks it —
+but the history role only touches its own tables.
 
 ### Retention and pruning
 
@@ -140,9 +193,3 @@ array of matching records.
 The endpoint supports TLS via the `history_cert_file`, `history_key_file`
 and `history_ca_file` configuration keys (see [Configuration](#configuration)
 below); when unset, the endpoint serves plain HTTP.
-
-## Console integration
-
-When `history` is set, the web console queries the history backend for
-recent data instead of performing a live scrape. When `history` is not set,
-the console behaves exactly as it does today.

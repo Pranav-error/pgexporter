@@ -33,7 +33,7 @@
 extern "C" {
 #endif
 
-#include <ev.h>
+#include "ev.h"
 #if HAVE_OPENBSD
 #include <sys/limits.h>
 #endif
@@ -108,6 +108,7 @@ extern "C" {
 #define HUGEPAGE_ON                  2
 
 #define HISTORY_BACKEND_SQLITE       0
+#define HISTORY_BACKEND_POSTGRESQL   1
 
 #define VERSION_GREATER              1
 #define VERSION_EQUAL                0
@@ -436,14 +437,25 @@ struct configuration
    int management;                          /**< The management port */
    int console;                             /**< The console port */
 
-   int history;                                  /**< The history API port (-1 = disabled) */
-   pgexporter_time_t history_interval;           /**< Interval between history snapshots */
-   pgexporter_time_t history_retention;          /**< How long to retain history records */
-   int history_backend;                          /**< The history storage backend */
-   char history_path[MAX_PATH];                  /**< Path for the history storage file */
-   char history_cert_file[MAX_PATH];             /**< History API TLS certificate path */
-   char history_key_file[MAX_PATH];              /**< History API TLS key path */
-   char history_ca_file[MAX_PATH];               /**< History API TLS CA certificate path */
+   int history;                         /**< The history API port (-1 = disabled) */
+   pgexporter_time_t history_interval;  /**< Interval between history snapshots */
+   pgexporter_time_t history_retention; /**< How long to retain history records */
+   int history_backend;                 /**< The history storage backend */
+   char history_path[MAX_PATH];         /**< Path for the history storage file */
+   char history_cert_file[MAX_PATH];    /**< History API TLS certificate path */
+   char history_key_file[MAX_PATH];     /**< History API TLS key path */
+   char history_ca_file[MAX_PATH];      /**< History API TLS CA certificate path */
+
+   char history_postgresql_host[MISC_LENGTH];         /**< Host of the history store, or a directory holding a Unix socket */
+   int history_postgresql_port;                       /**< Port of the history store, or the Unix socket number */
+   char history_postgresql_database[MISC_LENGTH];     /**< Database holding the series/sample schema */
+   char history_postgresql_user[MAX_USERNAME_LENGTH]; /**< Role to authenticate as when reading and writing history */
+   char history_postgresql_password_file[MAX_PATH];   /**< Encrypted credential for that role; empty for trust/peer auth */
+   int history_postgresql_tls;                        /**< TLS negotiation mode for the connection (SERVER_TLS_*) */
+   char history_postgresql_tls_cert_file[MAX_PATH];   /**< Client certificate presented to the history store */
+   char history_postgresql_tls_key_file[MAX_PATH];    /**< Private key belonging to that client certificate */
+   char history_postgresql_tls_ca_file[MAX_PATH];     /**< CA verifying the history store's certificate; needed when tls is on */
+
    atomic_bool history_worker_running;           /**< State of the history ticker */
    atomic_int_least64_t history_last_store_time; /**< Timestamp of last store */
    atomic_int history_worker_pid;                /**< PID of the forked history ticker worker (0 if none) */
@@ -541,6 +553,7 @@ struct configuration
    struct server servers[NUMBER_OF_SERVERS];                     /**< The servers */
    struct user users[NUMBER_OF_USERS];                           /**< The users */
    struct user admins[NUMBER_OF_ADMINS];                         /**< The admins */
+   struct user history_user;                                     /**< Resolved history store credential; password may be empty for trust/peer */
    struct prometheus prometheus[NUMBER_OF_METRICS];              /**< The Prometheus metrics */
    struct endpoint endpoints[NUMBER_OF_ENDPOINTS];               /**< The Prometheus metrics */
    struct extension_metrics extensions[NUMBER_OF_EXTENSIONS];    /**< Extension metrics by extension */
