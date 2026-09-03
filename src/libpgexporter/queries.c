@@ -260,6 +260,10 @@ pgexporter_execute_command(int server, char* sql)
 
    size = 1 + 4 + strlen(sql) + 1;
    content = (char*)malloc(size);
+   if (content == NULL)
+   {
+      goto error;
+   }
    memset(content, 0, size);
 
    pgexporter_write_byte(content, 'Q');
@@ -737,6 +741,10 @@ query_execute(int server, char* qs, char* tag, int columns, char* names[], struc
 
    size = 1 + 4 + strlen(qs) + 1;
    content = (char*)malloc(size);
+   if (content == NULL)
+   {
+      goto error;
+   }
    memset(content, 0, size);
 
    pgexporter_write_byte(content, 'Q');
