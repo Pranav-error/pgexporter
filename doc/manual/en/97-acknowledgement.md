@@ -42,6 +42,7 @@ Sakshi Aggarwal <sakshiaggarwal2706@gmail.com>
 Ameen Sakr <ameensakr623@gmail.com>
 youssef-joe <joe92228@gmail.com>
 Omar ElAzouny <omarlazouny@gmail.com>
+R Sai Pranav <rajasaipranav0@gmail.com>
 ```
 
 ## Committers
